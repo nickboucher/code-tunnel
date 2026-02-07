@@ -21,16 +21,23 @@ Install code-tunnel and the VS Code CLI.
 
 Options:
   -d, --dir DIR          Installation directory (default: $DEFAULT_INSTALL_DIR)
-  -a, --account ACCOUNT  Default SLURM account (sets CODE_TUNNEL_ACCOUNT)
-  -p, --partition PART   Default SLURM partition (sets CODE_TUNNEL_PARTITION)
+  -a, --account ACCOUNT  Default SLURM account
+  -p, --partition PART   Default SLURM partition
+      --cpus N           Default CPUs per task
+      --gpus GRES        Default GPU resource spec
+      --mem MEM          Default memory (e.g. 16G)
+      --qos QOS          Default quality of service
+      --nodes N          Default number of nodes
+      --ntasks N         Default number of tasks
   -h, --help             Show this help message
+
+If not provided as flags, the installer will prompt interactively
+for SLURM defaults.
 
 Examples:
   $(basename "$0")
-  $(basename "$0") --dir /opt/code-tunnel
-  $(basename "$0") --account myacct --partition gpu
+  $(basename "$0") --account myacct --partition gpu --qos high
   curl -fsSL $REPO_URL/install.sh | bash
-  curl -fsSL $REPO_URL/install.sh | bash -s -- --account myacct --partition gpu
 EOF
     exit 0
 }
@@ -41,11 +48,23 @@ EOF
 INSTALL_DIR="$DEFAULT_INSTALL_DIR"
 SLURM_ACCOUNT=""
 SLURM_PARTITION=""
+SLURM_CPUS=""
+SLURM_GPUS=""
+SLURM_MEM=""
+SLURM_QOS=""
+SLURM_NODES=""
+SLURM_NTASKS=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -d|--dir)       INSTALL_DIR="$2";    shift 2 ;;
         -a|--account)   SLURM_ACCOUNT="$2";  shift 2 ;;
         -p|--partition) SLURM_PARTITION="$2"; shift 2 ;;
+        --cpus)         SLURM_CPUS="$2";     shift 2 ;;
+        --gpus)         SLURM_GPUS="$2";     shift 2 ;;
+        --mem)          SLURM_MEM="$2";       shift 2 ;;
+        --qos)          SLURM_QOS="$2";       shift 2 ;;
+        --nodes)        SLURM_NODES="$2";     shift 2 ;;
+        --ntasks)       SLURM_NTASKS="$2";    shift 2 ;;
         -h|--help) usage ;;
         *)         die "Unknown option: $1" ;;
     esac
@@ -55,18 +74,40 @@ done
 INSTALL_DIR="${INSTALL_DIR/#\~/$HOME}"
 
 ###############################################################################
-# Prompt interactively for missing SLURM settings
+# Prompt interactively for SLURM defaults
 # Read from /dev/tty so prompts work even when piped (curl | bash)
 ###############################################################################
-if [[ -z "$SLURM_ACCOUNT" ]]; then
-    read -rp "[code-tunnel] Enter your default SLURM account: " SLURM_ACCOUNT </dev/tty
-fi
-if [[ -z "$SLURM_PARTITION" ]]; then
-    read -rp "[code-tunnel] Enter your default SLURM partition: " SLURM_PARTITION </dev/tty
-fi
+prompt_default() {
+    local var_name="$1" prompt_text="$2" required="${3:-false}" current_val="$4"
+    if [[ -n "$current_val" ]]; then
+        echo "$current_val"
+        return
+    fi
+    local val=""
+    if [[ "$required" == true ]]; then
+        while [[ -z "$val" ]]; do
+            read -rp "[code-tunnel] $prompt_text: " val </dev/tty
+            [[ -n "$val" ]] || echo "[code-tunnel] This field is required." >/dev/tty
+        done
+    else
+        read -rp "[code-tunnel] $prompt_text (press Enter to skip): " val </dev/tty
+    fi
+    echo "$val"
+}
 
-[[ -n "$SLURM_ACCOUNT" ]]   || die "SLURM account is required."
-[[ -n "$SLURM_PARTITION" ]] || die "SLURM partition is required."
+info ""
+info "Configure default SLURM settings"
+info "(these can always be overridden per-invocation with flags)"
+info ""
+
+SLURM_ACCOUNT=$(prompt_default  CODE_TUNNEL_ACCOUNT   "SLURM account (required)"       true  "$SLURM_ACCOUNT")
+SLURM_PARTITION=$(prompt_default CODE_TUNNEL_PARTITION "SLURM partition (required)"     true  "$SLURM_PARTITION")
+SLURM_QOS=$(prompt_default      CODE_TUNNEL_QOS       "Quality of service (QOS)"        false "$SLURM_QOS")
+SLURM_CPUS=$(prompt_default     CODE_TUNNEL_CPUS      "CPUs per task [default: 2]"      false "$SLURM_CPUS")
+SLURM_GPUS=$(prompt_default     CODE_TUNNEL_GPUS      "GPU GRES spec [default: gpu:1]"  false "$SLURM_GPUS")
+SLURM_MEM=$(prompt_default      CODE_TUNNEL_MEM       "Memory (e.g. 16G)"               false "$SLURM_MEM")
+SLURM_NODES=$(prompt_default    CODE_TUNNEL_NODES     "Nodes [default: 1]"              false "$SLURM_NODES")
+SLURM_NTASKS=$(prompt_default   CODE_TUNNEL_NTASKS    "Tasks [default: 1]"              false "$SLURM_NTASKS")
 
 ###############################################################################
 # Detect architecture and libc
@@ -141,128 +182,118 @@ exec "$INSTALL_DIR/code-tunnel.sh" "\$@"
 SHIM
 chmod +x "$INSTALL_DIR/bin/tunnel"
 
-# --- Add to PATH ---
+# --- Add to PATH and write SLURM defaults to shell config ---
 BIN_DIR="$INSTALL_DIR/bin"
-PATH_LINE="export PATH=\"$BIN_DIR:\$PATH\"  # Added by code-tunnel installer"
 MARKER="# Added by code-tunnel installer"
-ACCOUNT_MARKER="# Added by code-tunnel installer (account)"
-PARTITION_MARKER="# Added by code-tunnel installer (partition)"
+BEGIN_MARKER="# >>> code-tunnel >>>"
+END_MARKER="# <<< code-tunnel <<<"
 
-add_to_shell_config() {
-    local rc_file="$1"
-    if [[ -f "$rc_file" ]] && grep -qF "$MARKER" "$rc_file" 2>/dev/null; then
-        info "PATH entry already present in $rc_file"
-        return
-    fi
-    if [[ -f "$rc_file" ]] || [[ "$rc_file" == "$2" ]]; then
+###############################################################################
+# Build the config block
+###############################################################################
+build_bash_block() {
+    local lines=()
+    lines+=("$BEGIN_MARKER")
+    lines+=("export PATH=\"$BIN_DIR:\$PATH\"")
+    [[ -n "$SLURM_ACCOUNT" ]]   && lines+=("export CODE_TUNNEL_ACCOUNT=\"$SLURM_ACCOUNT\"")
+    [[ -n "$SLURM_PARTITION" ]] && lines+=("export CODE_TUNNEL_PARTITION=\"$SLURM_PARTITION\"")
+    [[ -n "$SLURM_QOS" ]]       && lines+=("export CODE_TUNNEL_QOS=\"$SLURM_QOS\"")
+    [[ -n "$SLURM_CPUS" ]]      && lines+=("export CODE_TUNNEL_CPUS=\"$SLURM_CPUS\"")
+    [[ -n "$SLURM_GPUS" ]]      && lines+=("export CODE_TUNNEL_GPUS=\"$SLURM_GPUS\"")
+    [[ -n "$SLURM_MEM" ]]       && lines+=("export CODE_TUNNEL_MEM=\"$SLURM_MEM\"")
+    [[ -n "$SLURM_NODES" ]]     && lines+=("export CODE_TUNNEL_NODES=\"$SLURM_NODES\"")
+    [[ -n "$SLURM_NTASKS" ]]    && lines+=("export CODE_TUNNEL_NTASKS=\"$SLURM_NTASKS\"")
+    lines+=("$END_MARKER")
+    printf '%s\n' "${lines[@]}"
+}
+
+build_fish_block() {
+    local lines=()
+    lines+=("$BEGIN_MARKER")
+    lines+=("set -gx PATH \"$BIN_DIR\" \$PATH")
+    [[ -n "$SLURM_ACCOUNT" ]]   && lines+=("set -gx CODE_TUNNEL_ACCOUNT \"$SLURM_ACCOUNT\"")
+    [[ -n "$SLURM_PARTITION" ]] && lines+=("set -gx CODE_TUNNEL_PARTITION \"$SLURM_PARTITION\"")
+    [[ -n "$SLURM_QOS" ]]       && lines+=("set -gx CODE_TUNNEL_QOS \"$SLURM_QOS\"")
+    [[ -n "$SLURM_CPUS" ]]      && lines+=("set -gx CODE_TUNNEL_CPUS \"$SLURM_CPUS\"")
+    [[ -n "$SLURM_GPUS" ]]      && lines+=("set -gx CODE_TUNNEL_GPUS \"$SLURM_GPUS\"")
+    [[ -n "$SLURM_MEM" ]]       && lines+=("set -gx CODE_TUNNEL_MEM \"$SLURM_MEM\"")
+    [[ -n "$SLURM_NODES" ]]     && lines+=("set -gx CODE_TUNNEL_NODES \"$SLURM_NODES\"")
+    [[ -n "$SLURM_NTASKS" ]]    && lines+=("set -gx CODE_TUNNEL_NTASKS \"$SLURM_NTASKS\"")
+    lines+=("$END_MARKER")
+    printf '%s\n' "${lines[@]}"
+}
+
+###############################################################################
+# Write (or replace) the config block in a shell rc file
+###############################################################################
+write_config_block() {
+    local rc_file="$1" block="$2"
+
+    if [[ -f "$rc_file" ]] && grep -qF "$BEGIN_MARKER" "$rc_file" 2>/dev/null; then
+        # Remove existing block and replace
+        local tmp="${rc_file}.code-tunnel-tmp"
+        awk -v begin="$BEGIN_MARKER" -v end="$END_MARKER" '
+            $0 == begin { skip=1; next }
+            $0 == end   { skip=0; next }
+            !skip
+        ' "$rc_file" > "$tmp"
+        echo "" >> "$tmp"
+        echo "$block" >> "$tmp"
+        mv "$tmp" "$rc_file"
+        info "Updated code-tunnel config in $rc_file"
+    else
+        # Also clean up any legacy single-line markers from older installs
+        if [[ -f "$rc_file" ]] && grep -qF "$MARKER" "$rc_file" 2>/dev/null; then
+            local tmp="${rc_file}.code-tunnel-tmp"
+            grep -vF "$MARKER" "$rc_file" > "$tmp"
+            mv "$tmp" "$rc_file"
+        fi
         echo "" >> "$rc_file"
-        echo "$PATH_LINE" >> "$rc_file"
-        info "Added $BIN_DIR to PATH in $rc_file"
+        echo "$block" >> "$rc_file"
+        info "Added code-tunnel config to $rc_file"
     fi
 }
 
-# Determine which shell config files to update
+###############################################################################
+# Determine the shell config file and write
+###############################################################################
 SHELL_NAME="$(basename "${SHELL:-/bin/bash}")"
-UPDATED_ANY=false
+UPDATED_RC=""
 
 case "$SHELL_NAME" in
     bash)
-        # Prefer .bashrc for interactive shells; also handle .bash_profile for login shells
+        # Write to .bashrc if it exists (preferred), else .bash_profile, else create .bashrc
         if [[ -f "$HOME/.bashrc" ]]; then
-            add_to_shell_config "$HOME/.bashrc" "$HOME/.bashrc"
-            UPDATED_ANY=true
+            UPDATED_RC="$HOME/.bashrc"
+        elif [[ -f "$HOME/.bash_profile" ]]; then
+            UPDATED_RC="$HOME/.bash_profile"
+        else
+            UPDATED_RC="$HOME/.bashrc"
+            touch "$UPDATED_RC"
         fi
-        if [[ -f "$HOME/.bash_profile" ]]; then
-            add_to_shell_config "$HOME/.bash_profile" "$HOME/.bash_profile"
-            UPDATED_ANY=true
-        fi
-        if [[ "$UPDATED_ANY" == false ]]; then
-            # No existing config — create .bashrc
-            add_to_shell_config "$HOME/.bashrc" "$HOME/.bashrc"
-            UPDATED_ANY=true
-        fi
+        write_config_block "$UPDATED_RC" "$(build_bash_block)"
         ;;
     zsh)
-        add_to_shell_config "$HOME/.zshrc" "$HOME/.zshrc"
-        UPDATED_ANY=true
+        UPDATED_RC="$HOME/.zshrc"
+        [[ -f "$UPDATED_RC" ]] || touch "$UPDATED_RC"
+        write_config_block "$UPDATED_RC" "$(build_bash_block)"
         ;;
     fish)
-        # Fish uses a different syntax
         FISH_CONFIG="$HOME/.config/fish/config.fish"
-        FISH_LINE="set -gx PATH \"$BIN_DIR\" \$PATH  $MARKER"
         mkdir -p "$(dirname "$FISH_CONFIG")"
-        if [[ -f "$FISH_CONFIG" ]] && grep -qF "$MARKER" "$FISH_CONFIG" 2>/dev/null; then
-            info "PATH entry already present in $FISH_CONFIG"
-        else
-            echo "" >> "$FISH_CONFIG"
-            echo "$FISH_LINE" >> "$FISH_CONFIG"
-            info "Added $BIN_DIR to PATH in $FISH_CONFIG"
-        fi
-        UPDATED_ANY=true
+        [[ -f "$FISH_CONFIG" ]] || touch "$FISH_CONFIG"
+        write_config_block "$FISH_CONFIG" "$(build_fish_block)"
+        UPDATED_RC="$FISH_CONFIG"
         ;;
     *)
         warn "Unknown shell '$SHELL_NAME'. Please add $BIN_DIR to your PATH manually."
         ;;
 esac
 
-# --- Write SLURM defaults to shell config if provided ---
-write_env_var() {
-    local rc_file="$1" var_name="$2" var_value="$3" marker="$4"
-    [[ -z "$var_value" ]] && return
-    if [[ -f "$rc_file" ]] && grep -qF "$marker" "$rc_file" 2>/dev/null; then
-        # Update existing line
-        if sed -i.bak "/$marker/c\\export ${var_name}=\"${var_value}\"  $marker" "$rc_file" 2>/dev/null; then
-            rm -f "${rc_file}.bak"
-        elif sed -i'' "/$marker/c\\export ${var_name}=\"${var_value}\"  $marker" "$rc_file" 2>/dev/null; then
-            :
-        fi
-        info "Updated $var_name in $rc_file"
-    elif [[ -f "$rc_file" ]]; then
-        echo "export ${var_name}=\"${var_value}\"  $marker" >> "$rc_file"
-        info "Added $var_name=$var_value to $rc_file"
-    fi
-}
-
-write_fish_env_var() {
-    local rc_file="$1" var_name="$2" var_value="$3" marker="$4"
-    [[ -z "$var_value" ]] && return
-    if [[ -f "$rc_file" ]] && grep -qF "$marker" "$rc_file" 2>/dev/null; then
-        if sed -i.bak "/$marker/c\\set -gx ${var_name} \"${var_value}\"  $marker" "$rc_file" 2>/dev/null; then
-            rm -f "${rc_file}.bak"
-        elif sed -i'' "/$marker/c\\set -gx ${var_name} \"${var_value}\"  $marker" "$rc_file" 2>/dev/null; then
-            :
-        fi
-        info "Updated $var_name in $rc_file"
-    elif [[ -f "$rc_file" ]]; then
-        echo "set -gx ${var_name} \"${var_value}\"  $marker" >> "$rc_file"
-        info "Added $var_name=$var_value to $rc_file"
-    fi
-}
-
-# Write account/partition to the same shell config files we updated for PATH
-case "$SHELL_NAME" in
-    bash)
-        for rc in "$HOME/.bashrc" "$HOME/.bash_profile"; do
-            [[ -f "$rc" ]] || continue
-            write_env_var "$rc" CODE_TUNNEL_ACCOUNT   "$SLURM_ACCOUNT"   "$ACCOUNT_MARKER"
-            write_env_var "$rc" CODE_TUNNEL_PARTITION "$SLURM_PARTITION" "$PARTITION_MARKER"
-        done
-        ;;
-    zsh)
-        write_env_var "$HOME/.zshrc" CODE_TUNNEL_ACCOUNT   "$SLURM_ACCOUNT"   "$ACCOUNT_MARKER"
-        write_env_var "$HOME/.zshrc" CODE_TUNNEL_PARTITION "$SLURM_PARTITION" "$PARTITION_MARKER"
-        ;;
-    fish)
-        FISH_CONFIG="$HOME/.config/fish/config.fish"
-        write_fish_env_var "$FISH_CONFIG" CODE_TUNNEL_ACCOUNT   "$SLURM_ACCOUNT"   "$ACCOUNT_MARKER"
-        write_fish_env_var "$FISH_CONFIG" CODE_TUNNEL_PARTITION "$SLURM_PARTITION" "$PARTITION_MARKER"
-        ;;
-esac
-
-if [[ "$UPDATED_ANY" == true ]]; then
+if [[ -n "$UPDATED_RC" ]]; then
     info ""
     info "Please restart your shell or run:"
-    info "  export PATH=\"$BIN_DIR:\$PATH\""
+    info "  source $UPDATED_RC"
 fi
 
 echo ""

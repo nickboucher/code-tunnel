@@ -40,24 +40,39 @@ done
 INSTALL_DIR="${INSTALL_DIR/#\~/$HOME}"
 
 ###############################################################################
-# Remove PATH entries from shell config files
+# Remove code-tunnel config from shell config files
 ###############################################################################
-MARKER="# Added by code-tunnel installer"
+LEGACY_MARKER="# Added by code-tunnel installer"
+BEGIN_MARKER="# >>> code-tunnel >>>"
+END_MARKER="# <<< code-tunnel <<<"
 
 remove_from_file() {
     local file="$1"
-    if [[ -f "$file" ]] && grep -qF "$MARKER" "$file" 2>/dev/null; then
-        # Create a backup, then remove all lines containing any code-tunnel marker
-        cp "$file" "${file}.code-tunnel-backup"
-        if sed -i.bak "/$MARKER/d" "$file" 2>/dev/null; then
-            rm -f "${file}.bak"
-        elif sed -i'' "/$MARKER/d" "$file" 2>/dev/null; then
-            :
-        else
-            grep -vF "$MARKER" "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
-        fi
-        info "Removed code-tunnel entries from $file (backup at ${file}.code-tunnel-backup)"
+    [[ -f "$file" ]] || return
+
+    local found=false
+
+    # Check for new block-style markers or legacy single-line markers
+    if grep -qF "$BEGIN_MARKER" "$file" 2>/dev/null || grep -qF "$LEGACY_MARKER" "$file" 2>/dev/null; then
+        found=true
     fi
+
+    [[ "$found" == true ]] || return
+
+    cp "$file" "${file}.code-tunnel-backup"
+
+    # Remove block between >>> and <<< markers, plus any legacy single-line markers
+    local tmp="${file}.code-tunnel-tmp"
+    awk -v begin="$BEGIN_MARKER" -v end="$END_MARKER" -v legacy="$LEGACY_MARKER" '
+        $0 == begin { skip=1; next }
+        $0 == end   { skip=0; next }
+        skip { next }
+        index($0, legacy) { next }
+        1
+    ' "$file" > "$tmp"
+    mv "$tmp" "$file"
+
+    info "Removed code-tunnel config from $file (backup at ${file}.code-tunnel-backup)"
 }
 
 # Check all common shell config files
