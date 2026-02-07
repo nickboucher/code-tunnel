@@ -26,17 +26,18 @@ Or with `wget`:
 wget -qO- https://raw.githubusercontent.com/nickboucher/code-tunnel/main/install.sh | bash
 ```
 
-This will:
+The installer will prompt you for your default SLURM account and partition, then:
 
 1. Download the VS Code CLI for your platform
-2. Install it to `~/.vscode-tunnel/bin/code`
-3. Install the `tunnel` command to `~/.vscode-tunnel/bin/tunnel`
-4. Add `~/.vscode-tunnel/bin` to your `PATH`
+2. Install it to `~/.vscode-tunnel/bin/`
+3. Install the `tunnel` command
+4. Configure your SLURM defaults
+5. Add everything to your `PATH`
 
-### Custom Install Directory
+You can also pass options non-interactively:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/nickboucher/code-tunnel/main/install.sh | bash -s -- --dir /opt/code-tunnel
+curl -fsSL .../install.sh | bash -s -- --account myaccount --partition gpu --dir /opt/code-tunnel
 ```
 
 ### Prerequisites

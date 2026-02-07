@@ -47,9 +47,8 @@ MARKER="# Added by code-tunnel installer"
 remove_from_file() {
     local file="$1"
     if [[ -f "$file" ]] && grep -qF "$MARKER" "$file" 2>/dev/null; then
-        # Create a backup, then remove the marked line(s) and any preceding blank line
+        # Create a backup, then remove all lines containing any code-tunnel marker
         cp "$file" "${file}.code-tunnel-backup"
-        # Remove lines containing the marker
         if sed -i.bak "/$MARKER/d" "$file" 2>/dev/null; then
             rm -f "${file}.bak"
         elif sed -i'' "/$MARKER/d" "$file" 2>/dev/null; then
@@ -57,7 +56,7 @@ remove_from_file() {
         else
             grep -vF "$MARKER" "$file" > "${file}.tmp" && mv "${file}.tmp" "$file"
         fi
-        info "Removed PATH entry from $file (backup at ${file}.code-tunnel-backup)"
+        info "Removed code-tunnel entries from $file (backup at ${file}.code-tunnel-backup)"
     fi
 }
 

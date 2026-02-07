@@ -20,14 +20,17 @@ Usage: $(basename "$0") [OPTIONS]
 Install code-tunnel and the VS Code CLI.
 
 Options:
-  -d, --dir DIR    Installation directory (default: $DEFAULT_INSTALL_DIR)
-  -h, --help       Show this help message
+  -d, --dir DIR          Installation directory (default: $DEFAULT_INSTALL_DIR)
+  -a, --account ACCOUNT  Default SLURM account (sets CODE_TUNNEL_ACCOUNT)
+  -p, --partition PART   Default SLURM partition (sets CODE_TUNNEL_PARTITION)
+  -h, --help             Show this help message
 
 Examples:
   $(basename "$0")
   $(basename "$0") --dir /opt/code-tunnel
+  $(basename "$0") --account myacct --partition gpu
   curl -fsSL $REPO_URL/install.sh | bash
-  curl -fsSL $REPO_URL/install.sh | bash -s -- --dir /opt/code-tunnel
+  curl -fsSL $REPO_URL/install.sh | bash -s -- --account myacct --partition gpu
 EOF
     exit 0
 }
@@ -36,9 +39,13 @@ EOF
 # Parse arguments
 ###############################################################################
 INSTALL_DIR="$DEFAULT_INSTALL_DIR"
+SLURM_ACCOUNT=""
+SLURM_PARTITION=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -d|--dir)  INSTALL_DIR="$2"; shift 2 ;;
+        -d|--dir)       INSTALL_DIR="$2";    shift 2 ;;
+        -a|--account)   SLURM_ACCOUNT="$2";  shift 2 ;;
+        -p|--partition) SLURM_PARTITION="$2"; shift 2 ;;
         -h|--help) usage ;;
         *)         die "Unknown option: $1" ;;
     esac
@@ -46,6 +53,20 @@ done
 
 # Expand ~ just in case (should already be expanded, but be safe)
 INSTALL_DIR="${INSTALL_DIR/#\~/$HOME}"
+
+###############################################################################
+# Prompt interactively for missing SLURM settings
+# Read from /dev/tty so prompts work even when piped (curl | bash)
+###############################################################################
+if [[ -z "$SLURM_ACCOUNT" ]]; then
+    read -rp "[code-tunnel] Enter your default SLURM account: " SLURM_ACCOUNT </dev/tty
+fi
+if [[ -z "$SLURM_PARTITION" ]]; then
+    read -rp "[code-tunnel] Enter your default SLURM partition: " SLURM_PARTITION </dev/tty
+fi
+
+[[ -n "$SLURM_ACCOUNT" ]]   || die "SLURM account is required."
+[[ -n "$SLURM_PARTITION" ]] || die "SLURM partition is required."
 
 ###############################################################################
 # Detect architecture and libc
@@ -132,6 +153,8 @@ chmod +x "$INSTALL_DIR/bin/tunnel"
 BIN_DIR="$INSTALL_DIR/bin"
 PATH_LINE="export PATH=\"$BIN_DIR:\$PATH\"  # Added by code-tunnel installer"
 MARKER="# Added by code-tunnel installer"
+ACCOUNT_MARKER="# Added by code-tunnel installer (account)"
+PARTITION_MARKER="# Added by code-tunnel installer (partition)"
 
 add_to_shell_config() {
     local rc_file="$1"
@@ -190,6 +213,60 @@ case "$SHELL_NAME" in
         ;;
 esac
 
+# --- Write SLURM defaults to shell config if provided ---
+write_env_var() {
+    local rc_file="$1" var_name="$2" var_value="$3" marker="$4"
+    [[ -z "$var_value" ]] && return
+    if [[ -f "$rc_file" ]] && grep -qF "$marker" "$rc_file" 2>/dev/null; then
+        # Update existing line
+        if sed -i.bak "/$marker/c\\export ${var_name}=\"${var_value}\"  $marker" "$rc_file" 2>/dev/null; then
+            rm -f "${rc_file}.bak"
+        elif sed -i'' "/$marker/c\\export ${var_name}=\"${var_value}\"  $marker" "$rc_file" 2>/dev/null; then
+            :
+        fi
+        info "Updated $var_name in $rc_file"
+    elif [[ -f "$rc_file" ]]; then
+        echo "export ${var_name}=\"${var_value}\"  $marker" >> "$rc_file"
+        info "Added $var_name=$var_value to $rc_file"
+    fi
+}
+
+write_fish_env_var() {
+    local rc_file="$1" var_name="$2" var_value="$3" marker="$4"
+    [[ -z "$var_value" ]] && return
+    if [[ -f "$rc_file" ]] && grep -qF "$marker" "$rc_file" 2>/dev/null; then
+        if sed -i.bak "/$marker/c\\set -gx ${var_name} \"${var_value}\"  $marker" "$rc_file" 2>/dev/null; then
+            rm -f "${rc_file}.bak"
+        elif sed -i'' "/$marker/c\\set -gx ${var_name} \"${var_value}\"  $marker" "$rc_file" 2>/dev/null; then
+            :
+        fi
+        info "Updated $var_name in $rc_file"
+    elif [[ -f "$rc_file" ]]; then
+        echo "set -gx ${var_name} \"${var_value}\"  $marker" >> "$rc_file"
+        info "Added $var_name=$var_value to $rc_file"
+    fi
+}
+
+# Write account/partition to the same shell config files we updated for PATH
+case "$SHELL_NAME" in
+    bash)
+        for rc in "$HOME/.bashrc" "$HOME/.bash_profile"; do
+            [[ -f "$rc" ]] || continue
+            write_env_var "$rc" CODE_TUNNEL_ACCOUNT   "$SLURM_ACCOUNT"   "$ACCOUNT_MARKER"
+            write_env_var "$rc" CODE_TUNNEL_PARTITION "$SLURM_PARTITION" "$PARTITION_MARKER"
+        done
+        ;;
+    zsh)
+        write_env_var "$HOME/.zshrc" CODE_TUNNEL_ACCOUNT   "$SLURM_ACCOUNT"   "$ACCOUNT_MARKER"
+        write_env_var "$HOME/.zshrc" CODE_TUNNEL_PARTITION "$SLURM_PARTITION" "$PARTITION_MARKER"
+        ;;
+    fish)
+        FISH_CONFIG="$HOME/.config/fish/config.fish"
+        write_fish_env_var "$FISH_CONFIG" CODE_TUNNEL_ACCOUNT   "$SLURM_ACCOUNT"   "$ACCOUNT_MARKER"
+        write_fish_env_var "$FISH_CONFIG" CODE_TUNNEL_PARTITION "$SLURM_PARTITION" "$PARTITION_MARKER"
+        ;;
+esac
+
 if [[ "$UPDATED_ANY" == true ]]; then
     info ""
     info "Please restart your shell or run:"
@@ -202,10 +279,6 @@ info " code-tunnel installed successfully!"
 info "============================================"
 info ""
 info "Quick start:"
-info "  tunnel -a <account> -p <partition> 60"
-info ""
-info "Or set defaults in your shell config:"
-info "  export CODE_TUNNEL_ACCOUNT=myaccount"
-info "  export CODE_TUNNEL_PARTITION=gpu"
+info "  tunnel 60"
 info ""
 info "Run 'tunnel --help' for all options."
