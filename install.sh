@@ -86,15 +86,7 @@ detect_platform() {
         *)              die "Unsupported architecture: $(uname -m)" ;;
     esac
 
-    # Detect musl vs glibc
-    local libc="linux"
-    if ldd --version 2>&1 | grep -qi musl; then
-        libc="alpine"
-    elif [ -f /etc/alpine-release ]; then
-        libc="alpine"
-    fi
-
-    echo "cli-${libc}-${arch}"
+    echo "cli-alpine-${arch}"
 }
 
 ###############################################################################
